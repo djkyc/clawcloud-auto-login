@@ -1,11 +1,33 @@
 方法 1: 在青龙面板中安装(推荐)
+
 进入青龙面板
+
 点击 依赖管理
+
 选择 Python3 标签
+
 在输入框中输入: pyotp
+
 点击 安装
+
+方法 2: SSH 进入容器安装
+
+
+# SSH 连接到服务器
+ssh root@你的服务器IP
+
+# 进入青龙容器
+docker exec -it qinglong bash
+
+# 安装 pyotp
+pip3 install pyotp
+
+# 退出容器
+exit
+
  
  一次性安装所有依赖
+ 
 在青龙面板的 依赖管理 → Python3 中,依次安装:
 
 selenium
@@ -14,13 +36,21 @@ requests
 loguru
 
 🎯 青龙面板定时任务设置
+
 进入青龙面板 → 定时任务
+
 点击 添加任务
+
 填写:
+
 名称: ClawCloud 自动登录
+
 命令: python3 /ql/data/scripts/clawcloud_login.py
+
 定时规则: 30 8 * * * (每天 8:30)
+
 或者: 0 */6 * * * (每 6 小时)
+
 点击 确定
 
 ---
