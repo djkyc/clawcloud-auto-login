@@ -3,7 +3,7 @@
 """
 ClawCloud 多账号自动保活脚本 - Selenium 版本
 适配青龙面板 ARM Docker 环境
-支持多账号、Cookie复用、2FA自动验证、Telegram 微信 通知
+支持多账号、Cookie复用、2FA自动验证、Telegram/微信 通知--也支持国内的docker环境和软件路由
 """
 
 import os
@@ -27,13 +27,7 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException
 # ============ 配置区域 ============
 
 # 方式1: 直接在脚本中配置(不推荐,仅用于测试)
-ACCOUNTS_CONFIG = [
-    # {
-    #     "username": "账号1@example.com",
-    #     "password": "密码1",
-    #     "totp_secret": ""  # 可选: GitHub 2FA 密钥
-    # },
-]
+ACCOUNTS_CONFIG = []
 
 # 方式2: 从环境变量读取(推荐)
 # 在青龙面板中配置:
@@ -54,7 +48,7 @@ def load_accounts_from_env():
             parts = acc_str.strip().split("----")
             if len(parts) >= 2:
                 account = {
-                    "username": parts[0].strip(),
+                    "username": parts[0].split('#')[0].strip(),
                     "password": parts[1].strip(),
                     "totp_secret": parts[2].strip() if len(parts) > 2 else ""
                 }
@@ -72,10 +66,33 @@ ACCOUNTS = load_accounts_from_env()
 
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
+WECHAT_API_URL = os.environ.get("WECHAT_API_URL", "").strip()
+WECHAT_AUTH_TOKEN = os.environ.get("WECHAT_AUTH_TOKEN", "").strip()
 CLAW_CLOUD_URL = os.environ.get("CLAW_CLOUD_URL", "https://eu-central-1.run.claw.cloud").strip()
 
 # 脚本目录
 SCRIPT_DIR = "/ql/data/scripts"
+
+# ============ 代理配置 ============
+# 优先读取 CLAW_PROXY, 其次是 ALL_PROXY, HTTP_PROXY
+CLAW_PROXY = os.environ.get("CLAW_PROXY") or os.environ.get("ALL_PROXY") or os.environ.get("HTTP_PROXY")
+
+if CLAW_PROXY:
+    # 关键修复: 如果使用了代理，必须设置 no_proxy 排除 localhost
+    # 否则 Selenium 无法连接 ChromeDriver
+    os.environ["no_proxy"] = "localhost,127.0.0.1,::1"
+    os.environ["NO_PROXY"] = "localhost,127.0.0.1,::1"
+    
+    # 确保 requests 库也能自动使用代理 (Telegram 需要)
+    os.environ["http_proxy"] = CLAW_PROXY
+    os.environ["https_proxy"] = CLAW_PROXY
+    os.environ["HTTP_PROXY"] = CLAW_PROXY
+    os.environ["HTTPS_PROXY"] = CLAW_PROXY
+    
+    logger.info(f"已启用代理配置: {CLAW_PROXY}")
+    logger.info("已设置 NO_PROXY 环境变量以保护本地 WebDriver 连接")
+else:
+    logger.info("未检测到代理配置，使用直连模式")
 # ================================
 
 
@@ -86,6 +103,7 @@ class Telegram:
         self.token = TG_BOT_TOKEN
         self.chat_id = int(TG_CHAT_ID) if TG_CHAT_ID and TG_CHAT_ID.isdigit() else None
         self.ok = bool(self.token and self.chat_id and self.token != "your_tg_bot_token")
+        self.last_update_id = 0
 
     def send(self, msg):
         """发送 TG 消息"""
@@ -118,6 +136,69 @@ class Telegram:
             logger.warning(f"TG 图片发送失败: {e}")
         return None
 
+    def get_updates(self, offset=None, timeout=30):
+        """获取 TG 更新"""
+        if not self.ok:
+            return []
+        url = f"https://api.telegram.org/bot{self.token}/getUpdates"
+        params = {"timeout": timeout}
+        if offset:
+            params["offset"] = offset
+        try:
+            resp = requests.get(url, params=params, timeout=timeout + 10)
+            if resp.ok:
+                return resp.json().get("result", [])
+        except Exception as e:
+            logger.warning(f"获取 TG 更新失败: {e}")
+        return []
+
+    def clear_pending_updates(self):
+        """清除由于积压的消息"""
+        try:
+            updates = self.get_updates(timeout=1)
+            if updates:
+                last_id = updates[-1]["update_id"]
+                self.last_update_id = last_id + 1
+                self.get_updates(offset=self.last_update_id, timeout=1)
+                logger.info("已清理 TG 积压消息")
+        except:
+            pass
+
+
+class WeChat:
+    """自定义微信通知类 (兼容 Nodeloc/LinuxDo 脚本配置)"""
+    def __init__(self):
+        self.url = WECHAT_API_URL
+        self.token = WECHAT_AUTH_TOKEN
+        self.ok = bool(self.url and self.token)
+
+    def send(self, content):
+        """发送文本消息"""
+        if not self.ok:
+            return
+        
+        params = {
+            "token": self.token,
+            "title": "ClawCloud 保活通知",
+            "content": content
+        }
+        
+        try:
+            # 优先尝试 GET 请求
+            resp = requests.get(self.url, params=params, timeout=10)
+            
+            # 如果 GET 失败 (405 Method Not Allowed), 尝试 POST
+            if resp.status_code == 405:
+                resp = requests.post(self.url, json=params, timeout=10)
+            
+            if resp.status_code >= 400:
+                logger.warning(f"微信通知发送失败 HTTP {resp.status_code}: {resp.text[:100]}")
+            else:
+                logger.info("微信通知发送成功")
+                
+        except Exception as e:
+            logger.warning(f"微信通知异常: {e}")
+
 
 class AutoLogin:
     """ClawCloud 自动登录和保活类"""
@@ -138,6 +219,7 @@ class AutoLogin:
             f"cookies_{self.username.replace('@', '_').replace('.', '_')}.json"
         )
         self.tg = Telegram()
+        self.wx = WeChat()
         self.old_cookies = self.load_cookies()
         self.balance = "未知"
         self.success = True
@@ -253,17 +335,22 @@ class AutoLogin:
 
     def wait_for_2fa_code_via_telegram(self, max_wait=180):
         """通过 TG 等待 2FA 验证码"""
+        if not self.tg.ok:
+            self.log("未配置 TG 机器人，无法进行交互式验证", "ERROR")
+            return False
+
         self.tg.clear_pending_updates()
 
         caption = (
             f"⚠️ 【第{self.account_index}个账号】GitHub 两步验证（Authenticator app）\n\n"
+            "⚠️ 检测到未配置 totp_secret (2FA密钥)\n"
             "请立即查看 Google Authenticator / Authy 等当前 6 位动态码\n"
-            "直接在本 TG 对话框回复数字（例如：123456）\n"
-            "脚本收到后会立即自动填写并提交（避免验证码过期）\n"
-            f"最多等待 {max_wait} 秒"
+            "👉 直接在本 TG 对话框回复数字（例如：123456）\n"
+            "🤖 脚本收到后会立即自动填写并提交\n"
+            f"⏳ 最多等待 {max_wait} 秒"
         )
         self.shot("两步验证页面", push_to_tg=True, caption=caption)
-        self.tg.send("正在等待您回复验证码...（回复后立即自动填写）")
+        self.tg.send("🚀 正在等待您回复验证码...（回复后立即自动填写）")
 
         self.authenticator_2fa = True
         start_time = time.time()
@@ -278,7 +365,7 @@ class AutoLogin:
                     text = message["text"].strip()
                     
                     if re.fullmatch(r'\d{6}', text):
-                        self.tg.send(f"收到验证码：{text}，立即自动填写并提交...")
+                        self.tg.send(f"✅ 收到验证码：{text}，立即自动填写并提交...")
                         
                         try:
                             # 查找 OTP 输入框
@@ -420,11 +507,11 @@ class AutoLogin:
                     page_text = self.driver.page_source
                     
                     if "Enter the code from your two-factor authentication app" in page_text:
-                        # Authenticator app - 使用 pyotp 自动生成
+                        # Authenticator app - 使用 pyotp 自动生成 或 TG 交互
                         self.authenticator_2fa = True
                         
                         if not self.totp_secret:
-                            # 没有配置密钥,发送 TG 通知
+                            # 没有配置密钥,发送 TG/微信 通知
                             caption = (
                                 f"⚠️ 【第{self.account_index}个账号】检测到 GitHub 两步验证\n\n"
                                 "未配置 totp_secret,无法自动填写验证码\n"
@@ -687,6 +774,11 @@ class AutoLogin:
         options.add_argument("--window-size=1920,1080")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option("useAutomationExtension", False)
+        
+        # 配置浏览器代理
+        if CLAW_PROXY:
+            options.add_argument(f"--proxy-server={CLAW_PROXY}")
+            
         options.binary_location = chrome_path
         
         try:
@@ -837,6 +929,10 @@ if __name__ == "__main__":
 
         tg = Telegram()
         tg.send(final_msg)
+        
+        # 发送企微通知
+        wx = WeChat()
+        wx.send(final_msg)
     
     print("\n" + "="*60)
     print("✅ 所有账号处理完成")
